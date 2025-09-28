@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DEBUGtionary</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Showdown for Markdown rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/showdown/2.1.0/showdown.min.js"></script>
+    <!-- Load Firebase -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-app.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, where, limit } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/10.12.3/firebase-firestore.js";
+        
+        // Set Firestore log level to Debug
+        setLogLevel('Debug');
+
+        // --- GLOBAL VARIABLES (CRITICAL CONFIGURATION) ---
+        
+        // 1. GEMINI API KEY (REQUIRED for the AI features to work)
+        // If running outside the Canvas, replace "YOUR_GEMINI_API_KEY_HERE" with your actual key.
+        const GEMINI_API_KEY_EXTERNAL = "AIzaSyBvznTBqgNH6duNxDv4fx2_vGc0zt1h4s4"; 
+
+        // 2. FIREBASE CONFIG (REQUIRED for the database history to work)
+        // UPDATED FOR debugtionary PROJECT:
+        const USER_FIREBASE_CONFIG = {
+            apiKey: "AIzaSyBDNbtHXevCNiGxC_7IKhp0Vujq_iRWGzg",
+            authDomain: "debugtionary.firebaseapp.com",
+            projectId: "debugtionary",
+            storageBucket: "debugtionary.firebasestorage.app",
+            messagingSenderId: "684651476777",
+            appId: "1:684651476777:web:b6e97b686351f5371fa938",
+            measurementId: "G-9E9JYDXVKK"
+        };
+
+        // --- STATE MANAGEMENT ---
+        let currentInputHash = null; // Hash of the currently displayed log/description
+        let currentInputSummary = null; // Summary of the current input
+
+        // --- INTERNAL ENVIRONMENT RESOLUTION ---
+
+        const isCanvasEnvironment = typeof __app_id !== 'undefined' && typeof __firebase_config !== 'undefined';
+        
+        // Final configuration for Firebase
+        const finalConfig = isCanvasEnvironment ? JSON.parse(__firebase_config) : USER_FIREBASE_CONFIG;
+        // Final unique identifier (used in DB path)
+        const finalAppId = isCanvasEnvironment ? __app_id : 'standalone-bug-explainer';
+        // Final API Key for Gemini
+        const finalApiKey = isCanvasEnvironment ? "" : GEMINI_API_KEY_EXTERNAL; 
+        
+        // The key used in the fetch call
+        const apiKey = finalApiKey; 
+        
+        // --- SYSTEM PROMPTS ---
+        const CODE_DEBUG_SYSTEM_PROMPT = `You are an elite, world-class Senior Software Engineer and expert debugger. Your task is to meticulously analyze the provided error log, stack trace, or bug description. 
+        Your response MUST be formatted EXACTLY in two main sections, using Markdown headings for clarity:
+        1.  # Explanation: What Went Wrong?
+            - Provide a clear, concise, and professional explanation of the root cause of the bug.
+        2.  # Suggested Fix: How to Solve It?
+            - Provide the most effective and idiomatic solution or code correction.
+            - Use a Markdown code block (e.g., \`\`\`python\\ncode\\n\`\`\`) for any specific code changes.
+        Be direct, accurate, and do not include any conversational filler outside of the two required sections.`;
+
+        const DIAGNOSIS_SYSTEM_PROMPT = `You are an expert system diagnostician. A user is describing a problem they are having with their computer, operating system, or application in natural language.
+        Your response MUST be formatted EXACTLY in two main sections, using Markdown headings for clarity:
+        1.  # Possible Causes & Diagnosis
+            - Based on the user's description, list 2-3 most probable underlying technical issues (e.g., 'Memory Leak', 'Driver Conflict', 'Corrupt System File').
+        2.  # Actionable Next Steps
+            - Provide 3-5 clear, easy-to-follow, numbered steps the user can take right now to troubleshoot or resolve the issue.
+        Be direct, professional, and use clear markdown formatting.`;
+
+
+        // --- FIREBASE INITIALIZATION & ANONYMOUS ID ---
+        let app, db, userId = null;
+        let isAuthReady = false;
+
+        // Function to get or generate a simple, anonymous user ID (UUID)
+        const getAnonymousUserId = () => {
+            let id = localStorage.getItem('anonBugExplainerId');
+            if (!id) {
+                id = crypto.randomUUID();
+                localStorage.setItem('anonBugExplainerId', id);
+            }
+            return id;
+        };
+
+        const initFirebase = async () => {
+            // Check for critical missing config in non-Canvas environment
+            if (!isCanvasEnvironment && (!finalConfig || finalConfig.apiKey === 'YOUR_FIREBASE_API_KEY_HERE')) {
+                document.getElementById('db-status').textContent = 'DB Failed: Config Missing';
+                showUserAlert("DATABASE ERROR: Firebase config is missing or incomplete. History is disabled.", 'error');
+                console.error("Firebase configuration is missing or incomplete. Check USER_FIREBASE_CONFIG.");
+                return; // Do not attempt to initialize Firebase
+            }
+
+            try {
+                app = initializeApp(finalConfig);
+                db = getFirestore(app);
+                
+                userId = getAnonymousUserId();
+
+                document.getElementById('db-status').textContent = `DB Ready (ID Type: Anonymous)`;
+                document.getElementById('user-id-display').textContent = `Anon ID: ${userId.substring(0, 8)}...`;
+                isAuthReady = true;
+
+                loadHistoryListener(db, userId);
+                loadAllCommentsListener();
+                switchSidebarView('history'); // Default to history view
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('db-status').textContent = `DB Error: ${error.name || 'Failed'}`;
+                showUserAlert(`DATABASE ERROR: Firebase failed to initialize. Check your console and configuration. (${error.message.substring(0, 50)}...)`, 'error');
+            }
+        };
+
+
+        // --- UTILITIES ---
+
+        // Simple hashing function (e.g., DJB2) to create a unique ID from the input string
+        const generateHash = (str) => {
+            let hash = 5381;
+            for (let i = 0; i < str.length; i++) {
+                hash = (hash * 33) ^ str.charCodeAt(i);
+            }
+            return (hash >>> 0).toString(16); // Convert to unsigned hex string
+        };
+
+
+        // --- FIRESTORE HISTORY LOGIC ---
+
+        const HISTORY_COLLECTION_NAME = 'bug_explainer_history';
+        const HISTORY_COLLECTION_PATH = (id) => isCanvasEnvironment 
+            ? `/artifacts/${finalAppId}/public/data/${HISTORY_COLLECTION_NAME}/${id}/history`
+            : `${HISTORY_COLLECTION_NAME}/${id}/history`; 
+            
+        const loadHistoryListener = (db, currentUserId) => {
+            if (!db || !currentUserId || !isAuthReady) return;
+
+            const q = query(
+                collection(db, HISTORY_COLLECTION_PATH(currentUserId)),
+                orderBy('timestamp', 'desc')
+            );
+
+            onSnapshot(q, (snapshot) => {
+                const historyList = document.getElementById('history-list');
+                historyList.innerHTML = '';
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const li = document.createElement('li');
+                    li.className = 'p-3 bg-gray-700 rounded-lg cursor-pointer hover:bg-gray-600 transition duration-150';
+                    const inputTitle = data.input_log ? data.input_log.substring(0, 50) + '...' : 
+                                       data.description_input ? data.description_input.substring(0, 50) + '...' : 
+                                       'Untitled entry';
+
+                    li.innerHTML = `
+                        <div class="text-sm text-yellow-300">${data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString() : 'N/A'}</div>
+                        <div class="font-semibold truncate">${inputTitle}</div>
+                    `;
+                    li.onclick = () => displaySingleResult(data);
+                    historyList.appendChild(li);
+                });
+            });
+        };
+
+        const saveExplanation = async (input, explanationText, inputType) => {
+            if (!db || !userId || !isAuthReady) return;
+            try {
+                const inputHash = generateHash(input);
+                const docData = {
+                    timestamp: serverTimestamp(),
+                    explanation_text: explanationText,
+                    input_type: inputType,
+                    input_hash: inputHash, // Save the deterministic hash
+                };
+                
+                if (inputType === 'log') {
+                    docData.input_log = input;
+                } else if (inputType === 'description') {
+                    docData.description_input = input;
+                }
+
+                await addDoc(collection(db, HISTORY_COLLECTION_PATH(userId)), docData);
+            } catch (error) {
+                console.error("Error saving explanation:", error);
+            }
+        };
+
+
+        // --- CHAT FORUM LOGIC ---
+
+        const COMMENTS_COLLECTION_NAME = 'public_bug_comments';
+        const COMMENTS_COLLECTION_PATH = (id) => isCanvasEnvironment 
+            ? `/artifacts/${finalAppId}/public/data/${COMMENTS_COLLECTION_NAME}` // Public, all-user collection
+            : `${COMMENTS_COLLECTION_NAME}`;
+            
+        // Renders comments from a snapshot
+        const renderComments = (snapshot, commentsContainer) => {
+            commentsContainer.innerHTML = '';
+            if (snapshot.empty) {
+                commentsContainer.innerHTML = `<p class="text-gray-400 text-sm p-4 text-center">No comments yet. Be the first to add one!</p>`;
+                return;
+            }
+
+            // Reverse the order to show newest at the bottom, like a chat feed (using flex-col-reverse in HTML)
+            snapshot.forEach((doc) => {
+                const data = doc.data();
+                const time = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString() : 'N/A';
+                const date = data.timestamp ? new Date(data.timestamp.toDate()).toLocaleDateString() : 'N/A';
+                
+                // Show input summary only in "All Comments" view
+                const inputContext = data.inputSummary && !currentInputHash // Only show context if it exists and we're in the GLOBAL view (currentInputHash is null)
+                    ? `<p class="text-xs text-yellow-300 mt-1 truncate">Re: ${data.inputSummary}</p>`
+                    : '';
+
+                const commentElement = document.createElement('div');
+                commentElement.className = 'bg-gray-700 p-3 rounded-lg break-words';
+                commentElement.innerHTML = `
+                    <p class="text-xs text-yellow-300 font-mono">${data.userId.substring(0, 8)}... - ${date} ${time}</p>
+                    ${inputContext}
+                    <p class="mt-1 text-white">${data.comment}</p>
+                `;
+                commentsContainer.appendChild(commentElement);
+            });
+        };
+
+        // Listens to all comments (used when no search is active)
+        const loadAllCommentsListener = () => {
+            if (!db || !isAuthReady) return;
+            const commentsContainer = document.getElementById('comments-list');
+            
+            const q = query(
+                collection(db, COMMENTS_COLLECTION_PATH(userId)),
+                orderBy('timestamp', 'desc'),
+                limit(50) // Limit to the 50 most recent comments globally
+            );
+
+            onSnapshot(q, (snapshot) => {
+                renderComments(snapshot, commentsContainer);
+            });
+        };
+
+        // Listens to comments specific to the current hash (used after a search)
+        const loadCommentsListener = (inputHash) => {
+            if (!db || !isAuthReady) return;
+            const commentsContainer = document.getElementById('comments-list');
+            
+            const q = query(
+                collection(db, COMMENTS_COLLECTION_PATH(userId)),
+                where('inputHash', '==', inputHash),
+                orderBy('timestamp', 'desc')
+            );
+
+            onSnapshot(q, (snapshot) => {
+                renderComments(snapshot, commentsContainer);
+            });
+        };
+
+        const postComment = async () => {
+            const commentInput = document.getElementById('comment-input');
+            const comment = commentInput.value.trim();
+
+            if (!comment) {
+                showUserAlert('Comment cannot be empty.', 'error');
+                return;
+            }
+
+            // Determine if we are posting a comment for a specific hash or just generally
+            const targetHash = currentInputHash; 
+            const inputSummary = targetHash ? currentInputSummary : null;
+
+            if (!db || !userId || !isAuthReady) {
+                 showUserAlert('Database not ready. Cannot post comment.', 'error');
+                 return;
+            }
+
+            try {
+                await addDoc(collection(db, COMMENTS_COLLECTION_PATH(userId)), {
+                    userId: userId,
+                    comment: comment,
+                    timestamp: serverTimestamp(),
+                    inputHash: targetHash,
+                    inputSummary: inputSummary
+                });
+
+                commentInput.value = ''; // Clear input
+                showUserAlert('Comment posted!', 'success');
+            } catch (error) {
+                console.error("Error posting comment:", error);
+                showUserAlert(`Failed to post comment: ${error.message}`, 'error');
+            }
+        };
+
+
+        // --- GEMINI API LOGIC ---
+
+        const converter = new showdown.Converter();
+        const markdownToHtml = (markdown) => converter.makeHtml(markdown);
+
+        const fetchWithRetry = async (url, options, maxRetries = 5) => {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    }
+                    if (response.status === 429 && i < maxRetries - 1) { 
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    } else {
+                        // Attempt to parse error message from API response
+                        const errorData = await response.json().catch(() => ({}));
+                        const errorMsg = errorData.error?.message || response.statusText;
+                        // Throw specific error for easier debugging
+                        throw new Error(`Gemini API Error ${response.status}: ${errorMsg}`);
+                    }
+                } catch (error) {
+                    if (i === maxRetries - 1) {
+                        throw error;
+                    }
+                }
+            }
+        };
+
+        const callGeminiAPI = async (userQuery, systemPrompt) => {
+            if (!apiKey || apiKey === 'YOUR_GEMINI_API_KEY_HERE') {
+                throw new Error("Gemini API Key is missing or using placeholder. AI analysis cannot proceed.");
+            }
+            
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            const options = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            };
+
+            const response = await fetchWithRetry(apiUrl, options);
+            const result = await response.json();
+
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (!text) {
+                console.error("Gemini response lacked text:", result);
+                throw new Error("Could not generate explanation. Check console for details.");
+            }
+            return text;
+        };
+
+        // --- UI HANDLERS ---
+        
+        // NEW ERROR ALERT FUNCTION
+        const showUserAlert = (message, type = 'info') => {
+            const alertContainer = document.getElementById('user-alert-container');
+            let color = {
+                info: 'bg-blue-100 border-blue-500 text-blue-700',
+                error: 'bg-red-100 border-red-500 text-red-700',
+                success: 'bg-green-100 border-green-500 text-green-700'
+            }[type] || 'bg-gray-100 border-gray-500 text-gray-700';
+
+            alertContainer.innerHTML = `
+                <div class="p-4 border-l-4 ${color} rounded-lg mb-6 shadow-md" role="alert">
+                    <p class="font-bold">${type.toUpperCase()}!</p>
+                    <p class="text-sm">${message}</p>
+                </div>
+            `;
+            // Clear alert after 8 seconds
+            setTimeout(() => {
+                alertContainer.innerHTML = '';
+            }, 8000);
+        };
+
+        const displayLoading = (buttonId, loadingId, isLoading) => {
+            const loadingIndicator = document.getElementById(loadingId);
+            const button = document.getElementById(buttonId);
+            if (isLoading) {
+                loadingIndicator.classList.remove('hidden');
+                button.disabled = true;
+                button.classList.add('opacity-50', 'cursor-not-allowed');
+            } else {
+                loadingIndicator.classList.add('hidden');
+                button.disabled = false;
+                button.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        };
+
+        const switchSidebarView = (view) => {
+            const historyTab = document.getElementById('history-tab');
+            const chatTab = document.getElementById('chat-tab');
+            
+            if (view === 'history') {
+                historyTab.classList.remove('hidden');
+                chatTab.classList.add('hidden');
+                // Clear state when switching to history
+                currentInputHash = null; 
+                currentInputSummary = null;
+            } else if (view === 'chat') {
+                historyTab.classList.add('hidden');
+                chatTab.classList.remove('hidden');
+                
+                if (currentInputHash) {
+                    // Specific chat view
+                    document.getElementById('chat-title').textContent = `Chat Forum (Re: ${currentInputSummary})`;
+                    loadCommentsListener(currentInputHash);
+                } else {
+                    // Global chat view (when loaded from the top tab bar)
+                    document.getElementById('chat-title').textContent = 'Chat Forum (All Recent Comments)';
+                    loadAllCommentsListener();
+                }
+            }
+            // Update button styles
+            document.getElementById('btn-history').classList.toggle('bg-gray-800', view === 'history');
+            document.getElementById('btn-history').classList.toggle('text-white', view === 'history');
+            document.getElementById('btn-history').classList.toggle('bg-gray-200', view !== 'history');
+            document.getElementById('btn-history').classList.toggle('text-gray-800', view !== 'history');
+            
+            document.getElementById('btn-chat').classList.toggle('bg-gray-800', view === 'chat');
+            document.getElementById('btn-chat').classList.toggle('text-white', view === 'chat');
+            document.getElementById('btn-chat').classList.toggle('bg-gray-200', view !== 'chat');
+            document.getElementById('btn-chat').classList.toggle('text-gray-800', view !== 'chat');
+        };
+
+        const displaySingleResult = (data) => {
+             const resultArea = document.getElementById('result-area');
+             const originalInput = data.input_type === 'log' ? data.input_log : data.description_input;
+             const inputTitle = data.input_type === 'log' ? 'Original Log/Query' : 'Original Problem Description';
+             
+             // Set global state for commenting
+             currentInputHash = data.input_hash;
+             currentInputSummary = originalInput.substring(0, 50) + '...';
+
+             // Automatically switch to the comment view scoped by the hash
+             switchSidebarView('chat'); 
+             
+             resultArea.innerHTML = `
+                 <div class="mb-4 p-4 bg-gray-100 rounded-lg border-l-4 border-yellow-500">
+                     <h2 class="text-xl font-bold text-gray-800 mb-2">${inputTitle} (from history):</h2>
+                     <pre class="bg-white p-3 rounded text-sm overflow-x-auto text-gray-600">${originalInput}</pre>
+                 </div>
+                 <div class="explanation-content bg-white p-6 rounded-xl shadow-lg border-t-4 border-indigo-600">
+                    ${markdownToHtml(data.explanation_text)}
+                 </div>
+             `;
+        };
+
+        const handleExplainBug = async () => {
+            const logInput = document.getElementById('log-input').value.trim();
+            const resultArea = document.getElementById('result-area');
+            resultArea.innerHTML = '';
+            showUserAlert("Analyzing your log...", 'info');
+
+            if (!logInput) {
+                showUserAlert('Please paste an error log or code snippet to analyze.', 'error');
+                return;
+            }
+
+            displayLoading('explain-button', 'log-loading-indicator', true);
+            
+            try {
+                const explanation = await callGeminiAPI(logInput, CODE_DEBUG_SYSTEM_PROMPT);
+                
+                // 1. Setup Hash and Summary
+                const inputHash = generateHash(logInput);
+                const inputSummary = logInput.substring(0, 50) + '...';
+                
+                // Set global state for commenting
+                currentInputHash = inputHash;
+                currentInputSummary = inputSummary;
+
+                // 2. Display the result
+                resultArea.innerHTML = `
+                    <div class="mb-4 p-4 bg-gray-100 rounded-lg border-l-4 border-yellow-500">
+                        <h2 class="text-xl font-bold text-gray-800 mb-2">Original Log/Query:</h2>
+                        <pre class="bg-white p-3 rounded text-sm overflow-x-auto text-gray-600">${logInput}</pre>
+                    </div>
+                    <div class="explanation-content bg-white p-6 rounded-xl shadow-lg border-t-4 border-indigo-600">
+                        ${markdownToHtml(explanation)}
+                    </div>
+                `;
+                showUserAlert("Analysis complete!", 'success');
+
+                // 3. Save to history and load comments
+                if (isAuthReady) {
+                    await saveExplanation(logInput, explanation, 'log');
+                }
+                switchSidebarView('chat'); // Switch to specific chat view
+                
+            } catch (error) {
+                currentInputHash = null; // Clear hash on failure
+                showUserAlert(`AI ANALYSIS FAILED: ${error.message}`, 'error');
+                console.error("Full analysis error:", error);
+            } finally {
+                displayLoading('explain-button', 'log-loading-indicator', false);
+            }
+        };
+
+        const handleDiagnoseProblem = async () => {
+            const descriptionInput = document.getElementById('description-input').value.trim();
+            const resultArea = document.getElementById('result-area');
+            resultArea.innerHTML = '';
+            showUserAlert("Diagnosing your problem...", 'info');
+
+            if (!descriptionInput) {
+                showUserAlert('Please describe the computer problem to get a diagnosis.', 'error');
+                return;
+            }
+
+            displayLoading('diagnose-button', 'diagnosis-loading-indicator', true);
+
+            try {
+                const explanation = await callGeminiAPI(descriptionInput, DIAGNOSIS_SYSTEM_PROMPT);
+                
+                // 1. Setup Hash and Summary
+                const inputHash = generateHash(descriptionInput);
+                const inputSummary = descriptionInput.substring(0, 50) + '...';
+
+                // Set global state for commenting
+                currentInputHash = inputHash;
+                currentInputSummary = inputSummary;
+
+                // 2. Display the result
+                resultArea.innerHTML = `
+                    <div class="mb-4 p-4 bg-gray-100 rounded-lg border-l-4 border-yellow-500">
+                        <h2 class="text-xl font-bold text-gray-800 mb-2">Original Problem Description:</h2>
+                        <pre class="bg-white p-3 rounded text-sm overflow-x-auto text-gray-600">${descriptionInput}</pre>
+                    </div>
+                    <div class="explanation-content bg-white p-6 rounded-xl shadow-lg border-t-4 border-indigo-600">
+                        ${markdownToHtml(explanation)}
+                    </div>
+                `;
+                showUserAlert("Diagnosis complete!", 'success');
+
+                // 3. Save to history and load comments
+                if (isAuthReady) {
+                    await saveExplanation(descriptionInput, explanation, 'description');
+                }
+                switchSidebarView('chat'); // Switch to specific chat view
+                
+            } catch (error) {
+                currentInputHash = null; // Clear hash on failure
+                showUserAlert(`AI DIAGNOSIS FAILED: ${error.message}`, 'error');
+                console.error("Full diagnosis error:", error);
+            } finally {
+                displayLoading('diagnose-button', 'diagnosis-loading-indicator', false);
+            }
+        };
+
+
+        // --- EVENT LISTENERS & SETUP ---
+        document.addEventListener('DOMContentLoaded', () => {
+            initFirebase();
+            
+            window.handleExplainBug = handleExplainBug;
+            window.handleDiagnoseProblem = handleDiagnoseProblem;
+            window.switchSidebarView = switchSidebarView;
+            window.postComment = postComment;
+
+            document.getElementById('explain-button').addEventListener('click', handleExplainBug);
+            document.getElementById('diagnose-button').addEventListener('click', handleDiagnoseProblem);
+            
+            // Set initial state for chat buttons on load
+            switchSidebarView('history'); 
+        });
+
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f4f7f9; /* Light background for the overall page */
+        }
+        /* Custom styles for the markdown output */
+        .explanation-content h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-top: 1.5rem;
+            margin-bottom: 0.75rem;
+            border-bottom: 2px solid #3b82f6; /* Blue border for sections */
+            padding-bottom: 4px;
+            color: #1f2937;
+        }
+        .explanation-content h1:nth-of-type(1) { /* Target the first H1 in the content */
+            margin-top: 0;
+        }
+        .explanation-content p {
+            margin-bottom: 1rem;
+            line-height: 1.6;
+            color: #374151;
+        }
+        .explanation-content pre {
+            background-color: #1f2937; /* Dark background for code blocks */
+            color: #f3f4f6;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+        }
+        .explanation-content code {
+            font-family: monospace;
+            background-color: #e5e7eb; /* Light background for inline code */
+            padding: 2px 4px;
+            border-radius: 4px;
+            color: #ef4444; /* Red color for inline code text */
+        }
+        .explanation-content ul, .explanation-content ol {
+            margin-left: 1.5rem;
+            margin-bottom: 1rem;
+            list-style-type: disc;
+            color: #374151;
+        }
+        .explanation-content ol {
+            list-style-type: decimal;
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+
+    <!-- Header and Status -->
+    <header class="mb-6 pb-4 border-b border-gray-200">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center">
+            <h1 class="text-3xl font-extrabold text-red-700">
+                <span class="text-yellow-500">AI</span> DEBUGtionary
+            </h1>
+            <div class="text-sm text-gray-500 mt-2 md:mt-0">
+                <span id="db-status" class="font-medium">DB Status: Initializing...</span> |
+                <span id="user-id-display" class="font-mono">Anon ID: N/A</span>
+            </div>
+        </div>
+        <p class="text-black-500 mt-1">Your AI Debugging Assistant, here to be an Online HelpDesk</p>
+    </header>
+
+    <main class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        
+        <!-- Input and Control Panel (Col 1 & 2) -->
+        <div class="lg:col-span-2 space-y-8">
+            
+            <!-- NEW ALERT CONTAINER -->
+            <div id="user-alert-container"></div>
+
+            <!-- FEATURE 1: LOG/CODE DEBUGGER -->
+            <div class="bg-white p-6 rounded-xl shadow-2xl border border-gray-100">
+                <h2 class="text-xl font-semibold mb-4 text-yellow-700">1. Enter Error log or Code</h2>
+                <textarea id="log-input" rows="8" placeholder="Paste your stack trace, error message, or problematic code here (e.g. Traceback, line 10, 404, etc.)" 
+                    class="w-full p-4 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500 transition duration-150 font-mono text-sm resize-none"
+                    ></textarea>
+                
+                <div class="flex items-center justify-between mt-4">
+                    <button id="explain-button" onclick="handleExplainBug()" 
+                        class="px-6 py-3 bg-green-600 text-white font-bold rounded-xl shadow-lg hover:bg-green-700 transition duration-300 ease-in-out transform hover:scale-[1.01] focus:outline-none focus:ring-4 focus:ring-green-300">
+                        <svg class="inline-block w-5 h-5 mr-2 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                        Explain & Solve Bug
+                    </button>
+                    
+                    <div id="log-loading-indicator" class="hidden flex items-center text-green-600">
+                        <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        Analyzing log...
+                    </div>
+                </div>
+            </div>
+
+            <!-- FEATURE 2: NATURAL LANGUAGE DIAGNOSIS -->
+            <div class="bg-white p-6 rounded-xl shadow-2xl border border-gray-100">
+                <h2 class="text-xl font-semibold mb-4 text-yellow-700">2. Describe a Computer Problem if Error is Unknown</h2>
+                <textarea id="description-input" rows="8" placeholder="Describe what is going wrong with your computer or application so the AI can provide possible diagnosis and next steps." 
+                    class="w-full p-4 border border-gray-300 rounded-lg focus:ring-yellow-500 focus:border-yellow-500 transition duration-150 font-mono text-sm resize-none"
+                    ></textarea>
+                
+                <div class="flex items-center justify-between mt-4">
+                    <button id="diagnose-button" onclick="handleDiagnoseProblem()" 
+                        class="px-6 py-3 bg-green-600 text-white font-bold rounded-xl shadow-lg hover:bg-green-700 transition duration-300 ease-in-out transform hover:scale-[1.01] focus:outline-none focus:ring-4 focus:ring-green-300">
+                        <svg class="inline-block w-5 h-5 mr-2 -mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        Diagnose Problem
+                    </button>
+                    
+                    <div id="diagnosis-loading-indicator" class="hidden flex items-center text-yellow-600">
+                        <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-yellow-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        Diagnosing issue...
+                    </div>
+                </div>
+            </div>
+
+            <!-- Result Area -->
+            <div id="result-area" class="mt-8">
+                <div class="p-6 bg-white rounded-xl shadow-inner border border-dashed border-gray-300 text-gray-500 text-center">
+                    The AI analysis (explanation, fix, or diagnosis) will appear here.
+                </div>
+            </div>
+
+        </div>
+        
+        <!-- History/Chat Sidebar (Col 3) -->
+        <div class="lg:col-span-1">
+            <div class="bg-white p-6 rounded-xl shadow-xl">
+                
+                <!-- Tab Controls -->
+                <div class="flex mb-4 p-1 bg-gray-200 rounded-lg">
+                    <button id="btn-history" onclick="switchSidebarView('history')" 
+                            class="flex-1 px-4 py-2 font-semibold text-sm rounded-lg transition duration-150 bg-gray-800 text-white">
+                        Bug History
+                    </button>
+                    <button id="btn-chat" onclick="switchSidebarView('chat')" 
+                            class="flex-1 px-4 py-2 font-semibold text-sm rounded-lg transition duration-150 text-gray-800">
+                        Chat Forum
+                    </button>
+                </div>
+
+                <!-- History View -->
+                <div id="history-tab">
+                    <h2 class="text-xl font-semibold mb-4 text-gray-700">Bug History (<span class="text-yellow-500">Database</span>)</h2>
+                    <div class="h-96 overflow-y-auto space-y-3 p-2 bg-gray-800 rounded-lg" id="history-list">
+                        <p class="text-gray-400 text-sm p-4 text-center">Your analyzed logs/diagnoses will appear here after initialization is complete.</p>
+                    </div>
+                </div>
+
+                <!-- Chat View -->
+                <div id="chat-tab" class="hidden">
+                    <h2 id="chat-title" class="text-xl font-semibold mb-4 text-gray-700">Chat Forum (All Recent Comments)</h2>
+                    <div class="h-64 overflow-y-auto space-y-3 p-2 bg-gray-800 rounded-lg flex flex-col-reverse" id="comments-list">
+                        <!-- Comments will be rendered here by JS -->
+                    </div>
+                    
+                    <!-- Comment Post Area -->
+                    <div id="comment-post-area" class="mt-4 pt-4 border-t border-gray-200">
+                        <textarea id="comment-input" rows="3" placeholder="Add a comment or solution..." 
+                                  class="w-full p-2 border border-gray-300 rounded-lg resize-none"></textarea>
+                        <button onclick="postComment()" 
+                                class="w-full mt-2 py-2 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-700 transition duration-200">
+                            Post Comment
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </main>
+
+</body>
+</html>
